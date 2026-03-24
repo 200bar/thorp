@@ -77,7 +77,7 @@ class ClaudeTrader:
         confidence_threshold: int = 70,
         ai_interval: float = 30.0,
         take_profit: float = 0.08,
-        stop_loss: float = 0.04,
+        stop_loss: float = 0.06,
         lookback: int = 100,
         patience: bool = False,
     ):
@@ -89,8 +89,9 @@ class ClaudeTrader:
         self.stop_loss = stop_loss
         self.lookback = lookback
         self.patience = patience
-        self.cooldown_seconds = 60.0  # wait after closing position
-        self.confidence_bump = 10  # extra confidence needed after a loss
+        self.cooldown_base = 60.0  # base cooldown after closing position
+        self.confidence_bump = 5  # extra confidence needed per consecutive loss
+        self.loss_decay_seconds = 180.0  # reset 1 consecutive loss every 3 min of no trading
 
         # State
         self.position: Optional[PaperPosition] = None
@@ -220,7 +221,7 @@ Trading history:
 
 This is a binary market: if {self.coin} price goes UP in this 15-minute window, "UP" token pays $1. If DOWN, "DOWN" token pays $1.
 
-RULE: Do NOT recommend buying if the token price is > 0.80 (too expensive, limited upside) or < 0.20 (too cheap/risky, likely losing side). Best value is in the 0.30-0.70 range.
+RULE: Do NOT recommend buying if the token price is > 0.70 (too expensive, limited upside) or < 0.30 (too cheap/risky, likely losing side). Best value is in the 0.35-0.65 range.
 
 LEARN from your trading history above. Notice which trades won/lost and why. Avoid repeating losing patterns. Double down on what works.
 
@@ -420,12 +421,26 @@ Respond ONLY with valid JSON:
                             self.paper_sell(current, f"AI SELL ({confidence}%)")
 
                     elif action in ("BUY_UP", "BUY_DOWN") and not self.position:
-                        # Patience: cooldown after last trade
+                        # Patience: time-based decay of consecutive losses
+                        if self.patience and self.consecutive_losses > 0 and self.last_trade_time > 0:
+                            idle_time = time.time() - self.last_trade_time
+                            decay_count = int(idle_time / self.loss_decay_seconds)
+                            if decay_count > 0:
+                                old_losses = self.consecutive_losses
+                                self.consecutive_losses = max(0, self.consecutive_losses - decay_count)
+                                if self.consecutive_losses < old_losses:
+                                    self.log(
+                                        f"Patience: {old_losses}→{self.consecutive_losses} losses (decay after {idle_time:.0f}s idle)",
+                                        "AI"
+                                    )
+
+                        # Patience: scaled cooldown after last trade
                         if self.patience and self.last_trade_time > 0:
+                            cooldown = self.cooldown_base * (1.5 ** min(self.consecutive_losses, 3))
                             elapsed = time.time() - self.last_trade_time
-                            if elapsed < self.cooldown_seconds:
+                            if elapsed < cooldown:
                                 self.log(
-                                    f"Patience: cooldown {self.cooldown_seconds - elapsed:.0f}s remaining, skipping",
+                                    f"Patience: cooldown {cooldown - elapsed:.0f}s remaining, skipping",
                                     "AI"
                                 )
                                 await asyncio.sleep(self.ai_interval)
@@ -434,7 +449,7 @@ Respond ONLY with valid JSON:
                         # Patience: raise confidence after consecutive losses
                         effective_threshold = self.confidence_threshold
                         if self.patience and self.consecutive_losses > 0:
-                            effective_threshold = min(95, self.confidence_threshold + self.confidence_bump * self.consecutive_losses)
+                            effective_threshold = min(90, self.confidence_threshold + self.confidence_bump * self.consecutive_losses)
                             self.log(
                                 f"Patience: {self.consecutive_losses} consecutive loss(es), threshold raised to {effective_threshold}%",
                                 "AI"
@@ -443,14 +458,14 @@ Respond ONLY with valid JSON:
                         if confidence >= effective_threshold:
                             side = "up" if action == "BUY_UP" else "down"
                             price = self.current_prices.get(side, 0)
-                            if price > 0.80:
+                            if price > 0.70:
                                 self.log(
-                                    f"Price {price:.4f} > 0.80 — too expensive, skipping",
+                                    f"Price {price:.4f} > 0.70 — too expensive, skipping",
                                     "AI"
                                 )
-                            elif price < 0.20:
+                            elif price < 0.30:
                                 self.log(
-                                    f"Price {price:.4f} < 0.20 — too cheap/risky, skipping",
+                                    f"Price {price:.4f} < 0.30 — too cheap/risky, skipping",
                                     "AI"
                                 )
                             elif price > 0:
@@ -502,9 +517,9 @@ Respond ONLY with valid JSON:
         self.log(f"Paper trader v3 (Claude AI) starting: {self.coin}")
         self.log(f"Size: ${self.size_usdc} | Confidence: {self.confidence_threshold}%")
         self.log(f"AI interval: {self.ai_interval}s | TP: +{self.take_profit} | SL: -{self.stop_loss}")
-        self.log(f"Price boundaries: skip buy if price > 0.80 or < 0.20")
+        self.log(f"Price boundaries: skip buy if price > 0.70 or < 0.30")
         if self.patience:
-            self.log(f"Patience mode: ON (cooldown {self.cooldown_seconds:.0f}s, +{self.confidence_bump}% per loss)")
+            self.log(f"Patience mode: ON (cooldown {self.cooldown_base:.0f}s×1.5^losses, +{self.confidence_bump}% per loss, decay {self.loss_decay_seconds:.0f}s)")
         self.log(f"Model: claude-haiku-4-5 (~$0.001 per call)")
         self.log("Ctrl+C to stop")
         self.log("")
@@ -561,7 +576,7 @@ async def main():
     parser.add_argument("--confidence", type=int, default=70, help="Min confidence to trade")
     parser.add_argument("--interval", type=float, default=30.0, help="Seconds between AI calls")
     parser.add_argument("--tp", type=float, default=0.08, help="Take profit")
-    parser.add_argument("--sl", type=float, default=0.04, help="Stop loss")
+    parser.add_argument("--sl", type=float, default=0.06, help="Stop loss")
     parser.add_argument("--patience", action="store_true", help="Patience mode: cooldown + higher confidence after losses")
     args = parser.parse_args()
 
