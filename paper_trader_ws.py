@@ -1,105 +1,47 @@
 """
-Paper Trading Bot v2 — WebSocket (real-time orderbook).
+Paper Trading Bot v2 — flash crash strategy on real-time WebSocket data.
 
-Używa Gamma API do discovery rynku + WebSocket do real-time cen.
-Monitoruje mid_price z orderbooka, nie snapshoty.
+Uses Gamma API for market discovery and CLOB WebSocket for live mid_price
+updates. Same flash-crash strategy as paper_trader.py but driven by orderbook
+events instead of sync polling.
 
-Użycie:
+Usage:
     source .venv/bin/activate
     python paper_trader_ws.py --coin ETH --size 10
-
-    --coin: BTC, ETH, SOL, XRP (default: ETH)
-    --size: wielkość pozycji w USDC (default: 10)
-    --drop: próg flash crash (default: 0.15)
-    --tp: take profit (default: 0.10)
-    --sl: stop loss (default: 0.05)
 """
 
 import argparse
 import asyncio
-import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional, Dict
-from collections import deque
-
 import logging
+from collections import deque
+from datetime import datetime
+from typing import Dict, Optional
 
 from src.gamma_client import GammaClient
+from src.paper_trading import PaperConfig, PaperTraderBase
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
 
-# Wycisz logi websocket (za głośne)
+# Silence chatty WS logger
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 
 
-@dataclass
-class PaperPosition:
-    """Symulowana pozycja."""
-    side: str
-    entry_price: float
-    size_usdc: float
-    shares: float
-    entry_time: float
-    take_profit: float
-    stop_loss: float
+class PaperTraderWS(PaperTraderBase):
+    """Flash crash strategy on WebSocket real-time orderbook feed."""
 
-    def pnl(self, current_price: float) -> float:
-        return (current_price - self.entry_price) * self.shares
-
-    def pnl_pct(self, current_price: float) -> float:
-        if self.entry_price == 0:
-            return 0
-        return ((current_price - self.entry_price) / self.entry_price) * 100
-
-    def should_take_profit(self, current_price: float) -> bool:
-        return current_price >= self.entry_price + self.take_profit
-
-    def should_stop_loss(self, current_price: float) -> bool:
-        return current_price <= self.entry_price - self.stop_loss
-
-
-class PaperTraderWS:
-    """Paper trading engine z WebSocket real-time data."""
-
-    def __init__(
-        self,
-        coin: str = "ETH",
-        size_usdc: float = 10.0,
-        drop_threshold: float = 0.15,
-        take_profit: float = 0.10,
-        stop_loss: float = 0.05,
-        lookback: int = 50,
-    ):
-        self.coin = coin
-        self.size_usdc = size_usdc
+    def __init__(self, config: PaperConfig, drop_threshold: float = 0.15):
+        super().__init__(config)
         self.drop_threshold = drop_threshold
-        self.take_profit = take_profit
-        self.stop_loss = stop_loss
-        self.lookback = lookback
 
-        # State
-        self.position: Optional[PaperPosition] = None
-        self.trades: list = []
-        self.price_history: Dict[str, deque] = {
-            "up": deque(maxlen=lookback),
-            "down": deque(maxlen=lookback),
-        }
+        # WS-specific state
         self.token_to_side: Dict[str, str] = {}
-        self.current_prices: Dict[str, float] = {}
-        self.current_slug: str = ""
-        self.update_count: int = 0
-
-        # Components
         self.gamma = GammaClient()
         self.ws = MarketWebSocket()
         self.needs_reconnect = False
 
-    def log(self, msg: str, level: str = "INFO"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        prefix = {"INFO": " ", "BUY": "+", "SELL": "-", "WIN": "$", "LOSS": "!", "WARN": "?", "WS": "~"}
-        print(f"[{ts}] [{prefix.get(level, ' ')}] {msg}")
+    # --- Strategy logic -------------------------------------------------
 
     def detect_flash_crash(self, side: str, current_price: float) -> Optional[float]:
+        """Return drop magnitude if a flash crash is detected on this side."""
         history = self.price_history[side]
         if len(history) < 5:
             return None
@@ -109,107 +51,40 @@ class PaperTraderWS:
             return drop
         return None
 
-    def paper_buy(self, side: str, price: float, drop: float):
-        shares = self.size_usdc / price
-        self.position = PaperPosition(
-            side=side,
-            entry_price=price,
-            size_usdc=self.size_usdc,
-            shares=shares,
-            entry_time=time.time(),
-            take_profit=self.take_profit,
-            stop_loss=self.stop_loss,
-        )
-        self.log(
-            f"PAPER BUY {side.upper()} @ {price:.4f} | "
-            f"${self.size_usdc:.2f} = {shares:.1f} shares | "
-            f"drop was {drop:.4f} | "
-            f"TP @ {price + self.take_profit:.4f} | SL @ {price - self.stop_loss:.4f}",
-            "BUY"
-        )
+    def _summary_extras(self) -> list:
+        return [
+            f"WebSocket updates received: {self.update_count}",
+            f"Drop threshold: {self.drop_threshold}",
+        ]
 
-    def paper_sell(self, price: float, reason: str):
-        if not self.position:
-            return
-        pnl = self.position.pnl(price)
-        pnl_pct = self.position.pnl_pct(price)
-        hold_time = time.time() - self.position.entry_time
-        self.trades.append({
-            "side": self.position.side,
-            "entry": self.position.entry_price,
-            "exit": price,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
-            "hold_seconds": hold_time,
-            "reason": reason,
-            "time": datetime.now().isoformat(),
-        })
-        level = "WIN" if pnl >= 0 else "LOSS"
-        self.log(
-            f"PAPER SELL {self.position.side.upper()} @ {price:.4f} | "
-            f"{reason} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%) | "
-            f"hold: {hold_time:.0f}s",
-            level
-        )
-        self.position = None
+    # --- UI -------------------------------------------------------------
 
-    def get_stats(self) -> dict:
-        wins = [t for t in self.trades if t["pnl"] >= 0]
-        losses = [t for t in self.trades if t["pnl"] < 0]
-        total_pnl = sum(t["pnl"] for t in self.trades)
-        return {
-            "total": len(self.trades),
-            "wins": len(wins),
-            "losses": len(losses),
-            "total_pnl": total_pnl,
-            "win_rate": (len(wins) / len(self.trades) * 100) if self.trades else 0,
-        }
-
-    def print_status(self):
+    def print_status(self) -> None:
         up = self.current_prices.get("up", 0)
         down = self.current_prices.get("down", 0)
         pos_str = ""
         if self.position:
             current = self.current_prices.get(self.position.side, 0)
             pnl = self.position.pnl(current)
-            pos_str = f" | POS: {self.position.side.upper()} @ {self.position.entry_price:.4f} PnL: ${pnl:+.2f}"
+            pos_str = (
+                f" | POS: {self.position.side.upper()} @ "
+                f"{self.position.entry_price:.4f} PnL: ${pnl:+.2f}"
+            )
         stats = self.get_stats()
-        print(
-            f"\r[{datetime.now().strftime('%H:%M:%S')}] "
-            f"{self.coin} UP={up:.4f} DOWN={down:.4f}"
+        text = (
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"{self.config.coin} UP={up:.4f} DOWN={down:.4f}"
             f"{pos_str} | "
-            f"W/L: {stats['wins']}/{stats['losses']} PnL: ${stats['total_pnl']:+.2f} "
-            f"| WS updates: {self.update_count}    ",
-            end="", flush=True
+            f"W/L: {stats['wins']}/{stats['losses']} "
+            f"PnL: ${stats['total_pnl']:+.2f} "
+            f"| WS updates: {self.update_count}    "
         )
+        self._emit_status(text)
 
-    def print_summary(self):
-        print("\n")
-        self.log("=" * 60)
-        self.log("PAPER TRADING SESSION SUMMARY (WebSocket)")
-        self.log("=" * 60)
-        stats = self.get_stats()
-        self.log(f"Coin: {self.coin}")
-        self.log(f"Trades: {stats['total']}")
-        self.log(f"Wins: {stats['wins']} | Losses: {stats['losses']}")
-        self.log(f"Win rate: {stats['win_rate']:.1f}%")
-        self.log(f"Total PnL: ${stats['total_pnl']:+.2f}")
-        self.log(f"WebSocket updates received: {self.update_count}")
-        self.log(f"Drop threshold: {self.drop_threshold}")
-        self.log(f"TP: +{self.take_profit} | SL: -{self.stop_loss}")
-        if self.trades:
-            self.log("")
-            self.log("Trade log:")
-            for i, t in enumerate(self.trades, 1):
-                self.log(
-                    f"  #{i} {t['side'].upper()} "
-                    f"entry={t['entry']:.4f} exit={t['exit']:.4f} "
-                    f"PnL=${t['pnl']:+.2f} ({t['pnl_pct']:+.1f}%) "
-                    f"{t['reason']} hold={t['hold_seconds']:.0f}s"
-                )
+    # --- WS callbacks + market mgmt -------------------------------------
 
-    async def on_book_update(self, snapshot: OrderbookSnapshot):
-        """Callback z WebSocket — nowy orderbook snapshot."""
+    async def on_book_update(self, snapshot: OrderbookSnapshot) -> None:
+        """Callback from WebSocket — new orderbook snapshot."""
         self.update_count += 1
         asset_id = snapshot.asset_id
         side = self.token_to_side.get(asset_id)
@@ -220,83 +95,92 @@ class PaperTraderWS:
         self.current_prices[side] = mid
         self.price_history[side].append(mid)
 
-        # Check TP/SL
+        # Check TP/SL on the active position
         if self.position and self.position.side == side:
-            current = mid
-            if self.position.should_take_profit(current):
+            if self.position.should_take_profit(mid):
                 print()
-                self.paper_sell(current, "TAKE PROFIT")
-            elif self.position.should_stop_loss(current):
+                self.paper_sell(mid, "TAKE PROFIT")
+            elif self.position.should_stop_loss(mid):
                 print()
-                self.paper_sell(current, "STOP LOSS")
+                self.paper_sell(mid, "STOP LOSS")
 
-        # Detect flash crash (jeśli nie mamy pozycji)
+        # Detect flash crash if no open position
         if not self.position:
             drop = self.detect_flash_crash(side, mid)
             if drop:
                 print()
-                self.paper_buy(side, mid, drop)
+                self.paper_buy(side, mid, extra_log=f"drop was {drop:.4f}")
 
-        # Status co 10 updates
+        # Status every 10 updates
         if self.update_count % 10 == 0:
             self.print_status()
 
     async def discover_and_subscribe(self) -> bool:
-        """Znajdź aktywny rynek i subskrybuj WebSocket."""
-        market = self.gamma.get_market_info(self.coin)
+        """Find current 15min market and prepare token mapping. Triggers
+        reconnect (sets needs_reconnect=True) when market changes.
+        """
+        market = self.gamma.get_market_info(self.config.coin)
         if not market:
-            self.log(f"No active 15min market for {self.coin}", "WARN")
+            self.log(f"No active 15min market for {self.config.coin}", "WARN")
             return False
 
         slug = market["slug"]
         token_ids = market["token_ids"]
 
         if slug != self.current_slug:
-            # Zamknij pozycję przy zmianie rynku
+            # Close any open position when market ends
             if self.position and self.current_prices.get(self.position.side, 0) > 0:
                 print()
                 self.paper_sell(
                     self.current_prices[self.position.side],
-                    "MARKET ENDED"
+                    "MARKET ENDED",
                 )
 
             self.current_slug = slug
-            self.price_history = {"up": deque(maxlen=self.lookback), "down": deque(maxlen=self.lookback)}
+            self.price_history = {
+                "up": deque(maxlen=self.config.lookback),
+                "down": deque(maxlen=self.config.lookback),
+            }
 
-            # Map token IDs to sides
             self.token_to_side = {}
             for side, token_id in token_ids.items():
                 self.token_to_side[token_id] = side
 
             print()
             self.log(f"Market: {market['question']}")
-            self.log(f"Token IDs: UP={token_ids.get('up', '?')[:16]}... DOWN={token_ids.get('down', '?')[:16]}...")
+            self.log(
+                f"Token IDs: UP={token_ids.get('up', '?')[:16]}... "
+                f"DOWN={token_ids.get('down', '?')[:16]}..."
+            )
 
-            # Reconnect WebSocket z nowymi tokenami
-            # (subscribe z replace nie działa po zmianie rynku — trzeba reconnect)
+            # Subscribe with replace doesn't work after market change — full reconnect
             self.needs_reconnect = True
 
         return True
 
-    async def market_refresh_loop(self):
-        """Co 30s sprawdzaj czy rynek się nie zmienił."""
+    async def market_refresh_loop(self) -> None:
+        """Every 30s check if the active market changed."""
         while True:
             await asyncio.sleep(30)
             try:
                 await self.discover_and_subscribe()
             except Exception as e:
+                # Don't kill the bot if a single refresh fails — log and retry
+                # next tick. Reguła 12 partial: we log loudly but recover.
                 self.log(f"Market refresh error: {e}", "WARN")
 
-    async def run(self):
-        """Główna pętla — reconnect przy zmianie rynku."""
-        self.log(f"Paper trader v2 (WebSocket) starting: {self.coin}")
-        self.log(f"Size: ${self.size_usdc} | Drop: {self.drop_threshold} | TP: +{self.take_profit} | SL: -{self.stop_loss}")
+    async def run(self) -> None:
+        """Main loop — reconnect on market change."""
+        self.log(f"Paper trader v2 (WebSocket) starting: {self.config.coin}")
+        self.log(
+            f"Size: ${self.config.size_usdc} | Drop: {self.drop_threshold} "
+            f"| TP: +{self.config.take_profit} | SL: -{self.config.stop_loss}"
+        )
         self.log("Ctrl+C to stop")
         self.log("")
 
         try:
             while True:
-                # Discover market
                 if not await self.discover_and_subscribe():
                     self.log("Cannot find active market, waiting...", "WARN")
                     await asyncio.sleep(10)
@@ -316,20 +200,16 @@ class PaperTraderWS:
                 def on_disconnect():
                     self.log("WebSocket disconnected", "WS")
 
-                # Subscribe to current tokens
                 all_tokens = list(self.token_to_side.keys())
                 await self.ws.subscribe(all_tokens)
 
-                # Run WS + market checker in parallel
-                # Market checker sets needs_reconnect=True when market changes
                 ws_task = asyncio.create_task(self.ws.run(auto_reconnect=True))
                 refresh_task = asyncio.create_task(self.market_refresh_loop())
 
-                # Wait until reconnect needed
+                # Wait until reconnect needed (set by market_refresh_loop)
                 while not self.needs_reconnect:
                     await asyncio.sleep(1)
 
-                # Stop current WS + refresh, then loop back to reconnect
                 self.ws.stop()
                 refresh_task.cancel()
                 try:
@@ -350,21 +230,31 @@ class PaperTraderWS:
 
 
 async def main():
+    defaults = PaperConfig()
+
     parser = argparse.ArgumentParser(description="Polymarket Paper Trader (WebSocket)")
-    parser.add_argument("--coin", default="ETH", choices=["BTC", "ETH", "SOL", "XRP"])
-    parser.add_argument("--size", type=float, default=10.0, help="Position size in USDC")
-    parser.add_argument("--drop", type=float, default=0.15, help="Flash crash threshold")
-    parser.add_argument("--tp", type=float, default=0.10, help="Take profit")
-    parser.add_argument("--sl", type=float, default=0.05, help="Stop loss")
+    parser.add_argument(
+        "--coin",
+        default=defaults.coin,
+        choices=PaperConfig.supported_coins(),
+    )
+    parser.add_argument("--size", type=float, default=defaults.size_usdc,
+                        help="Position size in USDC")
+    parser.add_argument("--drop", type=float, default=0.15,
+                        help="Flash crash threshold")
+    parser.add_argument("--tp", type=float, default=defaults.take_profit,
+                        help="Take profit")
+    parser.add_argument("--sl", type=float, default=defaults.stop_loss,
+                        help="Stop loss")
     args = parser.parse_args()
 
-    trader = PaperTraderWS(
+    config = PaperConfig(
         coin=args.coin,
         size_usdc=args.size,
-        drop_threshold=args.drop,
         take_profit=args.tp,
         stop_loss=args.sl,
     )
+    trader = PaperTraderWS(config=config, drop_threshold=args.drop)
 
     try:
         await trader.run()
