@@ -1,8 +1,22 @@
-# Polymarket Trading Bot
+# thorp
+
+> Multi-platform algorithmic trader for prediction markets.
+> Named after **Edward O. Thorp** — mathematician who first proved markets can be beaten with math.
 
 English | [简体中文](README_CN.md)
 
-A beginner-friendly Python trading bot for Polymarket with gasless transactions and real-time WebSocket data.
+A Python trading bot for Polymarket (and, in time, other prediction-market platforms) with gasless transactions and real-time WebSocket data.
+
+## Attribution
+
+This project is based on [`discountry/polymarket-trading-bot`](https://github.com/discountry/polymarket-trading-bot)
+(MIT licensed, originally published in 2024). The upstream repository was removed from
+GitHub by its author in 2026 — this fork preserves the codebase under the same MIT
+license, with full git history and original commit authorship intact.
+
+Renamed to **thorp** in honor of Edward O. Thorp, the mathematician who pioneered
+algorithmic edge in both gambling (1962, *Beat the Dealer*) and financial markets
+(1967, *Beat the Market* + Princeton/Newport Partners hedge fund).
 
 ## Features
 
