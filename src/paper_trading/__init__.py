@@ -14,5 +14,12 @@ import from here and add their own strategy logic on top.
 from .config import PaperConfig
 from .position import PaperPosition
 from .retry import with_retry, with_retry_async
+from .trader import PaperTraderBase
 
-__all__ = ["PaperConfig", "PaperPosition", "with_retry", "with_retry_async"]
+__all__ = [
+    "PaperConfig",
+    "PaperPosition",
+    "PaperTraderBase",
+    "with_retry",
+    "with_retry_async",
+]
