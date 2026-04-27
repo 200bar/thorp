@@ -1,163 +1,147 @@
 """
-Paper Trading Bot v3 — Claude AI + WebSocket.
+Paper Trading Bot v3 — Claude AI decision engine on WebSocket data.
 
-Claude Haiku analizuje rynek co N sekund i decyduje:
-- BUY UP, BUY DOWN, lub HOLD
-- z confidence score (0-100)
+Claude Haiku analyzes the market every N seconds and decides BUY UP /
+BUY DOWN / HOLD / SELL with a confidence score. Trades only execute
+when confidence exceeds the threshold and the price is in the
+[0.30, 0.70] band.
 
-Trade tylko gdy confidence > threshold.
+Optional patience mode: cooldown after losses + raised confidence
+threshold + time-based decay of consecutive losses.
 
-Użycie:
+Usage:
     source .venv/bin/activate
     export ANTHROPIC_API_KEY=sk-ant-...
     python paper_trader_ai.py --coin ETH --size 10
-
-    --coin: BTC, ETH, SOL, XRP (default: ETH)
-    --size: wielkość pozycji w USDC (default: 10)
-    --confidence: min confidence do trade (default: 70)
-    --interval: sekundy między zapytaniami do Claude (default: 30)
-    --tp: take profit (default: 0.08)
-    --sl: stop loss (default: 0.04)
-    --patience: patience mode (cooldown + higher confidence after losses)
 """
 
 import argparse
 import asyncio
 import json
+import logging
 import os
 import time
-import logging
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, Dict
 from collections import deque
+from datetime import datetime
+from typing import Dict, Optional
 
 import aiohttp
 import anthropic
 
 from src.gamma_client import GammaClient
+from src.paper_trading import (
+    PaperConfig,
+    PaperTraderBase,
+    with_retry_async,
+)
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
 
 logging.getLogger("src.websocket_client").setLevel(logging.WARNING)
 
 
-@dataclass
-class PaperPosition:
-    side: str
-    entry_price: float
-    size_usdc: float
-    shares: float
-    entry_time: float
-    take_profit: float
-    stop_loss: float
-    reason: str = ""
-
-    def pnl(self, current_price: float) -> float:
-        return (current_price - self.entry_price) * self.shares
-
-    def pnl_pct(self, current_price: float) -> float:
-        if self.entry_price == 0:
-            return 0
-        return ((current_price - self.entry_price) / self.entry_price) * 100
-
-    def should_take_profit(self, current_price: float) -> bool:
-        return current_price >= self.entry_price + self.take_profit
-
-    def should_stop_loss(self, current_price: float) -> bool:
-        return current_price <= self.entry_price - self.stop_loss
+# Binance spot symbol mapping for context price lookup. Strategy-specific
+# constant (paper_trader.py and paper_trader_ws.py don't use Binance).
+SPOT_SYMBOLS = {
+    "ETH": "ETHUSDT",
+    "BTC": "BTCUSDT",
+    "SOL": "SOLUSDT",
+    "XRP": "XRPUSDT",
+}
 
 
-class ClaudeTrader:
-    """Paper trading z Claude AI jako decision engine."""
+class ClaudeTrader(PaperTraderBase):
+    """Paper trading where Claude AI makes the buy/sell decisions."""
 
     def __init__(
         self,
-        coin: str = "ETH",
-        size_usdc: float = 10.0,
+        config: PaperConfig,
         confidence_threshold: int = 70,
         ai_interval: float = 30.0,
-        take_profit: float = 0.08,
-        stop_loss: float = 0.06,
-        lookback: int = 100,
         patience: bool = False,
     ):
-        self.coin = coin
-        self.size_usdc = size_usdc
+        super().__init__(config)
+
         self.confidence_threshold = confidence_threshold
         self.ai_interval = ai_interval
-        self.take_profit = take_profit
-        self.stop_loss = stop_loss
-        self.lookback = lookback
         self.patience = patience
-        self.cooldown_base = 60.0  # base cooldown after closing position
-        self.confidence_bump = 5  # extra confidence needed per consecutive loss
-        self.loss_decay_seconds = 180.0  # reset 1 consecutive loss every 3 min of no trading
 
-        # State
-        self.position: Optional[PaperPosition] = None
+        # Patience tuning constants (strategy-specific, not in PaperConfig)
+        self.cooldown_base = 60.0       # base cooldown after closing position
+        self.confidence_bump = 5        # extra confidence per consecutive loss
+        self.loss_decay_seconds = 180.0  # reset 1 loss every 3 min idle
+
+        # Strategy state
         self.last_trade_time: float = 0.0
         self.consecutive_losses: int = 0
-        self.trades: list = []
-        self.price_history: Dict[str, deque] = {
-            "up": deque(maxlen=lookback),
-            "down": deque(maxlen=lookback),
-        }
-        self.token_to_side: Dict[str, str] = {}
-        self.current_prices: Dict[str, float] = {}
-        self.current_slug: str = ""
-        self.current_question: str = ""
-        self.update_count: int = 0
         self.ai_calls: int = 0
         self.ai_cost_usd: float = 0.0
-        self.needs_reconnect = False
         self.spot_price: Optional[float] = None
-
-        # Binance symbol mapping
-        self.spot_symbols = {
-            "ETH": "ETHUSDT",
-            "BTC": "BTCUSDT",
-            "SOL": "SOLUSDT",
-            "XRP": "XRPUSDT",
-        }
+        self.current_question: str = ""
+        self.token_to_side: Dict[str, str] = {}
+        self.needs_reconnect = False
 
         # Components
         self.gamma = GammaClient()
         self.ws = MarketWebSocket()
         self.claude = anthropic.Anthropic()
 
-    def log(self, msg: str, level: str = "INFO"):
-        ts = datetime.now().strftime("%H:%M:%S")
-        prefix = {
-            "INFO": " ", "BUY": "+", "SELL": "-", "WIN": "$",
-            "LOSS": "!", "WARN": "?", "WS": "~", "AI": "*"
-        }
-        print(f"[{ts}] [{prefix.get(level, ' ')}] {msg}")
+    # --- Hooks: extend base behavior --------------------------------------
 
-    async def fetch_spot_price(self):
-        """Pobierz aktualną cenę spot z Binance."""
-        symbol = self.spot_symbols.get(self.coin)
+    def _on_trade_closed(self, trade: dict) -> None:
+        """Update patience-mode state after every trade close."""
+        self.last_trade_time = time.time()
+        if trade["pnl"] < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+    def _summary_extras(self) -> list:
+        return [
+            f"AI calls: {self.ai_calls} | AI cost: ${self.ai_cost_usd:.4f}",
+            f"Confidence threshold: {self.confidence_threshold}%",
+        ]
+
+    def _trade_log_extra(self, trade: dict) -> str:
+        return f"AI: {trade.get('entry_reason', '')}"
+
+    # --- Spot price (Binance) -------------------------------------------
+
+    async def fetch_spot_price(self) -> None:
+        """Fetch live spot price from Binance for AI context. Best-effort —
+        on failure, log and keep last known price (price is informational only).
+        """
+        symbol = SPOT_SYMBOLS.get(self.config.coin)
         if not symbol:
             return
         url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=5)
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         self.spot_price = float(data["price"])
-        except Exception:
-            pass  # Keep last known price
+                    else:
+                        self.log(
+                            f"Binance spot price returned HTTP {resp.status}",
+                            "WARN",
+                        )
+        except Exception as e:
+            # Reguła 12 partial: not raising (spot price is non-critical),
+            # but logging so the failure is visible (no more silent `pass`).
+            self.log(f"Spot price fetch failed: {e}", "WARN")
+
+    # --- Claude prompting -----------------------------------------------
 
     def get_market_context(self) -> str:
-        """Zbuduj kontekst rynkowy dla Claude."""
+        """Build the market context block injected into Claude's prompt."""
         up = self.current_prices.get("up", 0)
         down = self.current_prices.get("down", 0)
 
-        # Ostatnie 20 cen (jeśli są)
         up_recent = list(self.price_history["up"])[-20:]
         down_recent = list(self.price_history["down"])[-20:]
 
-        # Trend
         up_trend = ""
         if len(up_recent) >= 5:
             first_5 = sum(up_recent[:5]) / 5
@@ -169,7 +153,6 @@ class ClaudeTrader:
             else:
                 up_trend = "STABLE"
 
-        # Pozycja info
         pos_info = "No open position."
         if self.position:
             current = self.current_prices.get(self.position.side, 0)
@@ -180,17 +163,23 @@ class ClaudeTrader:
                 f"entry={self.position.entry_price:.4f} "
                 f"current={current:.4f} PnL=${pnl:+.2f} "
                 f"hold={hold:.0f}s "
-                f"TP={self.position.entry_price + self.take_profit:.4f} "
-                f"SL={self.position.entry_price - self.stop_loss:.4f}"
+                f"TP={self.position.entry_price + self.config.take_profit:.4f} "
+                f"SL={self.position.entry_price - self.config.stop_loss:.4f}"
             )
 
-        spot_info = f"Live {self.coin} spot price (Binance): ${self.spot_price:,.2f}" if self.spot_price else f"Live {self.coin} spot price: unavailable"
+        spot_info = (
+            f"Live {self.config.coin} spot price (Binance): ${self.spot_price:,.2f}"
+            if self.spot_price
+            else f"Live {self.config.coin} spot price: unavailable"
+        )
 
-        # Trading history (last 10 trades)
         history_info = "No trades yet this session."
         if self.trades:
             stats = self.get_stats()
-            lines = [f"Session: {stats['total']} trades, {stats['wins']}W/{stats['losses']}L, win rate {stats['win_rate']:.0f}%, PnL ${stats['total_pnl']:+.2f}"]
+            lines = [
+                f"Session: {stats['total']} trades, {stats['wins']}W/{stats['losses']}L, "
+                f"win rate {stats['win_rate']:.0f}%, PnL ${stats['total_pnl']:+.2f}"
+            ]
             for t in self.trades[-10:]:
                 lines.append(
                     f"  {t['side'].upper()} entry={t['entry']:.4f} exit={t['exit']:.4f} "
@@ -199,7 +188,7 @@ class ClaudeTrader:
             history_info = "\n".join(lines)
 
         return f"""Market: {self.current_question}
-Coin: {self.coin}
+Coin: {self.config.coin}
 {spot_info}
 Current prices: UP={up:.4f} DOWN={down:.4f}
 UP trend (last 20 ticks): {up_trend}
@@ -212,14 +201,21 @@ Trading history:
 {history_info}"""
 
     async def ask_claude(self) -> Optional[dict]:
-        """Zapytaj Claude o decyzję tradingową."""
+        """Ask Claude for a trading decision. Returns parsed dict or None.
+
+        Network/rate-limit errors get retried with backoff (with_retry_async).
+        After exhausting retries we log and return None — the AI loop skips
+        this tick rather than crashing the bot. This is a deliberate
+        compromise on Reguła 12: log loudly but recover, because Claude API
+        rate limits are an expected runtime condition, not a programming bug.
+        """
         context = self.get_market_context()
 
         prompt = f"""You are a prediction market trading bot analyzing a 15-minute crypto Up/Down market on Polymarket.
 
 {context}
 
-This is a binary market: if {self.coin} price goes UP in this 15-minute window, "UP" token pays $1. If DOWN, "DOWN" token pays $1.
+This is a binary market: if {self.config.coin} price goes UP in this 15-minute window, "UP" token pays $1. If DOWN, "DOWN" token pays $1.
 
 RULE: Do NOT recommend buying if the token price is > 0.70 (too expensive, limited upside) or < 0.30 (too cheap/risky, likely losing side). Best value is in the 0.35-0.65 range.
 
@@ -235,98 +231,43 @@ If I already have an open position, you can also suggest HOLD (keep position) or
 Respond ONLY with valid JSON:
 {{"action": "BUY_UP" | "BUY_DOWN" | "HOLD" | "SELL", "confidence": 0-100, "reason": "..."}}"""
 
-        try:
-            response = self.claude.messages.create(
+        async def call_claude():
+            return await asyncio.to_thread(
+                self.claude.messages.create,
                 model="claude-haiku-4-5-20251001",
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            self.ai_calls += 1
-            # Estimate cost (Haiku: $1/M input, $5/M output)
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
-            cost = (input_tokens * 1.0 + output_tokens * 5.0) / 1_000_000
-            self.ai_cost_usd += cost
+        try:
+            response = await with_retry_async(call_claude, log_fn=self.log)
+        except Exception as e:
+            # 3 retries exhausted; skip this tick rather than crash
+            self.log(f"Claude API permanently failed: {e}", "WARN")
+            return None
 
-            text = response.content[0].text.strip()
-            # Parse JSON from response
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            result = json.loads(text)
-            return result
+        self.ai_calls += 1
+        # Estimate cost (Haiku 4.5: ~$1/M input, ~$5/M output)
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        cost = (input_tokens * 1.0 + output_tokens * 5.0) / 1_000_000
+        self.ai_cost_usd += cost
 
+        text = response.content[0].text.strip()
+        # Strip optional markdown JSON fence
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        try:
+            return json.loads(text)
         except json.JSONDecodeError:
             self.log(f"Claude returned non-JSON: {text[:100]}", "WARN")
             return None
-        except Exception as e:
-            self.log(f"Claude API error: {e}", "WARN")
-            return None
 
-    def paper_buy(self, side: str, price: float, reason: str, confidence: int):
-        shares = self.size_usdc / price
-        self.position = PaperPosition(
-            side=side,
-            entry_price=price,
-            size_usdc=self.size_usdc,
-            shares=shares,
-            entry_time=time.time(),
-            take_profit=self.take_profit,
-            stop_loss=self.stop_loss,
-            reason=reason,
-        )
-        self.log(
-            f"PAPER BUY {side.upper()} @ {price:.4f} | "
-            f"${self.size_usdc:.2f} = {shares:.1f} shares | "
-            f"confidence: {confidence}% | {reason}",
-            "BUY"
-        )
+    # --- WS callback ----------------------------------------------------
 
-    def paper_sell(self, price: float, reason: str):
-        if not self.position:
-            return
-        pnl = self.position.pnl(price)
-        pnl_pct = self.position.pnl_pct(price)
-        hold_time = time.time() - self.position.entry_time
-        self.trades.append({
-            "side": self.position.side,
-            "entry": self.position.entry_price,
-            "exit": price,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
-            "hold_seconds": hold_time,
-            "reason": reason,
-            "entry_reason": self.position.reason,
-            "time": datetime.now().isoformat(),
-        })
-        level = "WIN" if pnl >= 0 else "LOSS"
-        self.log(
-            f"PAPER SELL {self.position.side.upper()} @ {price:.4f} | "
-            f"{reason} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%) | hold: {hold_time:.0f}s",
-            level
-        )
-        self.last_trade_time = time.time()
-        if pnl < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
-        self.position = None
-
-    def get_stats(self) -> dict:
-        wins = [t for t in self.trades if t["pnl"] >= 0]
-        losses = [t for t in self.trades if t["pnl"] < 0]
-        total_pnl = sum(t["pnl"] for t in self.trades)
-        return {
-            "total": len(self.trades),
-            "wins": len(wins),
-            "losses": len(losses),
-            "total_pnl": total_pnl,
-            "win_rate": (len(wins) / len(self.trades) * 100) if self.trades else 0,
-        }
-
-    async def on_book_update(self, snapshot: OrderbookSnapshot):
+    async def on_book_update(self, snapshot: OrderbookSnapshot) -> None:
         self.update_count += 1
         asset_id = snapshot.asset_id
         side = self.token_to_side.get(asset_id)
@@ -336,7 +277,7 @@ Respond ONLY with valid JSON:
         self.current_prices[side] = mid
         self.price_history[side].append(mid)
 
-        # Check TP/SL
+        # TP/SL on active position
         if self.position and self.position.side == side:
             if self.position.should_take_profit(mid):
                 print()
@@ -345,11 +286,12 @@ Respond ONLY with valid JSON:
                 print()
                 self.paper_sell(mid, "STOP LOSS")
 
-        # Status co 20 updates
         if self.update_count % 20 == 0:
             self.print_status()
 
-    def print_status(self):
+    # --- Status line ----------------------------------------------------
+
+    def print_status(self) -> None:
         up = self.current_prices.get("up", 0)
         down = self.current_prices.get("down", 0)
         pos_str = ""
@@ -358,48 +300,26 @@ Respond ONLY with valid JSON:
             pnl = self.position.pnl(current)
             pos_str = f" | POS: {self.position.side.upper()} PnL: ${pnl:+.2f}"
         stats = self.get_stats()
-        spot_str = f" SPOT=${self.spot_price:,.0f}" if self.spot_price else ""
-        print(
-            f"\r[{datetime.now().strftime('%H:%M:%S')}] "
-            f"{self.coin}{spot_str} UP={up:.4f} DOWN={down:.4f}"
-            f"{pos_str} | "
-            f"W/L: {stats['wins']}/{stats['losses']} PnL: ${stats['total_pnl']:+.2f} "
-            f"| AI: {self.ai_calls} calls ${self.ai_cost_usd:.4f}    ",
-            end="", flush=True
+        spot_str = (
+            f" SPOT=${self.spot_price:,.0f}" if self.spot_price else ""
         )
+        text = (
+            f"[{datetime.now().strftime('%H:%M:%S')}] "
+            f"{self.config.coin}{spot_str} UP={up:.4f} DOWN={down:.4f}"
+            f"{pos_str} | "
+            f"W/L: {stats['wins']}/{stats['losses']} "
+            f"PnL: ${stats['total_pnl']:+.2f} "
+            f"| AI: {self.ai_calls} calls ${self.ai_cost_usd:.4f}    "
+        )
+        self._emit_status(text)
 
-    def print_summary(self):
-        print("\n")
-        self.log("=" * 60)
-        self.log("PAPER TRADING SESSION SUMMARY (Claude AI)")
-        self.log("=" * 60)
-        stats = self.get_stats()
-        self.log(f"Coin: {self.coin}")
-        self.log(f"Trades: {stats['total']}")
-        self.log(f"Wins: {stats['wins']} | Losses: {stats['losses']}")
-        self.log(f"Win rate: {stats['win_rate']:.1f}%")
-        self.log(f"Total PnL: ${stats['total_pnl']:+.2f}")
-        self.log(f"AI calls: {self.ai_calls} | AI cost: ${self.ai_cost_usd:.4f}")
-        self.log(f"Confidence threshold: {self.confidence_threshold}%")
-        self.log(f"TP: +{self.take_profit} | SL: -{self.stop_loss}")
-        if self.trades:
-            self.log("")
-            self.log("Trade log:")
-            for i, t in enumerate(self.trades, 1):
-                self.log(
-                    f"  #{i} {t['side'].upper()} "
-                    f"entry={t['entry']:.4f} exit={t['exit']:.4f} "
-                    f"PnL=${t['pnl']:+.2f} ({t['pnl_pct']:+.1f}%) "
-                    f"{t['reason']} | AI: {t.get('entry_reason', '')}"
-                )
+    # --- AI decision loop -----------------------------------------------
 
-    async def ai_loop(self):
-        """Co ai_interval sekund pytaj Claude o decyzję."""
-        # Czekaj na dane z WS
-        await asyncio.sleep(5)
+    async def ai_loop(self) -> None:
+        """Every ai_interval seconds, ask Claude for a decision."""
+        await asyncio.sleep(5)  # warmup so we have data
 
         while True:
-            # Potrzebujemy min. 5 data points
             if len(self.price_history["up"]) >= 5:
                 await self.fetch_spot_price()
                 decision = await self.ask_claude()
@@ -412,7 +332,7 @@ Respond ONLY with valid JSON:
                     print()
                     self.log(
                         f"AI: {action} (confidence: {confidence}%) — {reason}",
-                        "AI"
+                        "AI",
                     )
 
                     if action == "SELL" and self.position:
@@ -427,21 +347,27 @@ Respond ONLY with valid JSON:
                             decay_count = int(idle_time / self.loss_decay_seconds)
                             if decay_count > 0:
                                 old_losses = self.consecutive_losses
-                                self.consecutive_losses = max(0, self.consecutive_losses - decay_count)
+                                self.consecutive_losses = max(
+                                    0, self.consecutive_losses - decay_count
+                                )
                                 if self.consecutive_losses < old_losses:
                                     self.log(
-                                        f"Patience: {old_losses}→{self.consecutive_losses} losses (decay after {idle_time:.0f}s idle)",
-                                        "AI"
+                                        f"Patience: {old_losses}->{self.consecutive_losses} "
+                                        f"losses (decay after {idle_time:.0f}s idle)",
+                                        "AI",
                                     )
 
                         # Patience: scaled cooldown after last trade
                         if self.patience and self.last_trade_time > 0:
-                            cooldown = self.cooldown_base * (1.5 ** min(self.consecutive_losses, 3))
+                            cooldown = self.cooldown_base * (
+                                1.5 ** min(self.consecutive_losses, 3)
+                            )
                             elapsed = time.time() - self.last_trade_time
                             if elapsed < cooldown:
                                 self.log(
-                                    f"Patience: cooldown {cooldown - elapsed:.0f}s remaining, skipping",
-                                    "AI"
+                                    f"Patience: cooldown {cooldown - elapsed:.0f}s "
+                                    f"remaining, skipping",
+                                    "AI",
                                 )
                                 await asyncio.sleep(self.ai_interval)
                                 continue
@@ -449,10 +375,15 @@ Respond ONLY with valid JSON:
                         # Patience: raise confidence after consecutive losses
                         effective_threshold = self.confidence_threshold
                         if self.patience and self.consecutive_losses > 0:
-                            effective_threshold = min(90, self.confidence_threshold + self.confidence_bump * self.consecutive_losses)
+                            effective_threshold = min(
+                                90,
+                                self.confidence_threshold
+                                + self.confidence_bump * self.consecutive_losses,
+                            )
                             self.log(
-                                f"Patience: {self.consecutive_losses} consecutive loss(es), threshold raised to {effective_threshold}%",
-                                "AI"
+                                f"Patience: {self.consecutive_losses} consecutive "
+                                f"loss(es), threshold raised to {effective_threshold}%",
+                                "AI",
                             )
 
                         if confidence >= effective_threshold:
@@ -461,27 +392,34 @@ Respond ONLY with valid JSON:
                             if price > 0.70:
                                 self.log(
                                     f"Price {price:.4f} > 0.70 — too expensive, skipping",
-                                    "AI"
+                                    "AI",
                                 )
                             elif price < 0.30:
                                 self.log(
                                     f"Price {price:.4f} < 0.30 — too cheap/risky, skipping",
-                                    "AI"
+                                    "AI",
                                 )
                             elif price > 0:
-                                self.paper_buy(side, price, reason, confidence)
+                                self.paper_buy(
+                                    side, price,
+                                    reason=reason,
+                                    extra_log=f"confidence: {confidence}%",
+                                )
                         else:
                             self.log(
-                                f"AI confidence {confidence}% < threshold {effective_threshold}%, skipping",
-                                "AI"
+                                f"AI confidence {confidence}% < threshold "
+                                f"{effective_threshold}%, skipping",
+                                "AI",
                             )
 
             await asyncio.sleep(self.ai_interval)
 
+    # --- Market discovery + main loop -----------------------------------
+
     async def discover_and_subscribe(self) -> bool:
-        market = self.gamma.get_market_info(self.coin)
+        market = self.gamma.get_market_info(self.config.coin)
         if not market:
-            self.log(f"No active 15min market for {self.coin}", "WARN")
+            self.log(f"No active 15min market for {self.config.coin}", "WARN")
             return False
 
         slug = market["slug"]
@@ -490,11 +428,17 @@ Respond ONLY with valid JSON:
         if slug != self.current_slug:
             if self.position and self.current_prices.get(self.position.side, 0) > 0:
                 print()
-                self.paper_sell(self.current_prices[self.position.side], "MARKET ENDED")
+                self.paper_sell(
+                    self.current_prices[self.position.side],
+                    "MARKET ENDED",
+                )
 
             self.current_slug = slug
             self.current_question = market.get("question", "")
-            self.price_history = {"up": deque(maxlen=self.lookback), "down": deque(maxlen=self.lookback)}
+            self.price_history = {
+                "up": deque(maxlen=self.config.lookback),
+                "down": deque(maxlen=self.config.lookback),
+            }
             self.token_to_side = {}
             for side, token_id in token_ids.items():
                 self.token_to_side[token_id] = side
@@ -505,7 +449,7 @@ Respond ONLY with valid JSON:
 
         return True
 
-    async def market_refresh_loop(self):
+    async def market_refresh_loop(self) -> None:
         while True:
             await asyncio.sleep(30)
             try:
@@ -513,14 +457,23 @@ Respond ONLY with valid JSON:
             except Exception as e:
                 self.log(f"Market refresh error: {e}", "WARN")
 
-    async def run(self):
-        self.log(f"Paper trader v3 (Claude AI) starting: {self.coin}")
-        self.log(f"Size: ${self.size_usdc} | Confidence: {self.confidence_threshold}%")
-        self.log(f"AI interval: {self.ai_interval}s | TP: +{self.take_profit} | SL: -{self.stop_loss}")
-        self.log(f"Price boundaries: skip buy if price > 0.70 or < 0.30")
+    async def run(self) -> None:
+        self.log(f"Paper trader v3 (Claude AI) starting: {self.config.coin}")
+        self.log(
+            f"Size: ${self.config.size_usdc} | Confidence: {self.confidence_threshold}%"
+        )
+        self.log(
+            f"AI interval: {self.ai_interval}s | TP: +{self.config.take_profit} "
+            f"| SL: -{self.config.stop_loss}"
+        )
+        self.log("Price boundaries: skip buy if price > 0.70 or < 0.30")
         if self.patience:
-            self.log(f"Patience mode: ON (cooldown {self.cooldown_base:.0f}s×1.5^losses, +{self.confidence_bump}% per loss, decay {self.loss_decay_seconds:.0f}s)")
-        self.log(f"Model: claude-haiku-4-5 (~$0.001 per call)")
+            self.log(
+                f"Patience mode: ON (cooldown {self.cooldown_base:.0f}s "
+                f"x 1.5^losses, +{self.confidence_bump}% per loss, "
+                f"decay {self.loss_decay_seconds:.0f}s)"
+            )
+        self.log("Model: claude-haiku-4-5 (~$0.001 per call)")
         self.log("Ctrl+C to stop")
         self.log("")
 
@@ -570,14 +523,26 @@ Respond ONLY with valid JSON:
 
 
 async def main():
+    defaults = PaperConfig()
+
     parser = argparse.ArgumentParser(description="Polymarket Paper Trader (Claude AI)")
-    parser.add_argument("--coin", default="ETH", choices=["BTC", "ETH", "SOL", "XRP"])
-    parser.add_argument("--size", type=float, default=10.0, help="Position size in USDC")
-    parser.add_argument("--confidence", type=int, default=70, help="Min confidence to trade")
-    parser.add_argument("--interval", type=float, default=30.0, help="Seconds between AI calls")
+    parser.add_argument(
+        "--coin",
+        default=defaults.coin,
+        choices=PaperConfig.supported_coins(),
+    )
+    parser.add_argument("--size", type=float, default=defaults.size_usdc,
+                        help="Position size in USDC")
+    parser.add_argument("--confidence", type=int, default=70,
+                        help="Min confidence to trade")
+    parser.add_argument("--interval", type=float, default=30.0,
+                        help="Seconds between AI calls")
+    # AI variant historically used different TP/SL defaults than the flash-crash
+    # variants — we override PaperConfig defaults here to match v4 production tuning.
     parser.add_argument("--tp", type=float, default=0.08, help="Take profit")
     parser.add_argument("--sl", type=float, default=0.06, help="Stop loss")
-    parser.add_argument("--patience", action="store_true", help="Patience mode: cooldown + higher confidence after losses")
+    parser.add_argument("--patience", action="store_true",
+                        help="Patience mode: cooldown + higher confidence after losses")
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -585,13 +550,17 @@ async def main():
         print("  export ANTHROPIC_API_KEY=sk-ant-...")
         return
 
-    trader = ClaudeTrader(
+    config = PaperConfig(
         coin=args.coin,
         size_usdc=args.size,
-        confidence_threshold=args.confidence,
-        ai_interval=args.interval,
         take_profit=args.tp,
         stop_loss=args.sl,
+        lookback=100,  # AI variant historically uses larger window
+    )
+    trader = ClaudeTrader(
+        config=config,
+        confidence_threshold=args.confidence,
+        ai_interval=args.interval,
         patience=args.patience,
     )
 
