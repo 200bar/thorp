@@ -12,5 +12,6 @@ import from here and add their own strategy logic on top.
 """
 
 from .position import PaperPosition
+from .config import PaperConfig
 
-__all__ = ["PaperPosition"]
+__all__ = ["PaperPosition", "PaperConfig"]
