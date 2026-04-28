@@ -22,6 +22,15 @@ requests>=2.28.0               # API calls
 # WebSocket for real-time data
 websockets>=12.0               # WebSocket client for market data
 
+# Async HTTP for spot price fetching (Binance) in paper_trader_ai.py
+aiohttp>=3.9.0                 # Async HTTP client
+
+# =============================================================================
+# AI / LLM (used by paper_trader_ai.py — Claude Haiku decision engine)
+# =============================================================================
+
+anthropic>=0.86.0              # Claude API client
+
 # =============================================================================
 # Polymarket API Clients (Optional - for advanced usage)
 # =============================================================================
