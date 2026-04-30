@@ -184,6 +184,7 @@ class PaperTraderBase:
 
     def print_summary(self) -> None:
         """End-of-session summary. Subclasses can extend via the two hooks."""
+        import sys
         print("\n")
         self.log("=" * 60)
         self.log(f"PAPER TRADING SESSION SUMMARY ({self.__class__.__name__})")
@@ -214,6 +215,10 @@ class PaperTraderBase:
                 if extra:
                     line = f"{line} | {extra}"
                 self.log(line)
+
+        # Flush stdout — when killed by SIGINT under cron, line buffer
+        # may not flush before process exits, dropping the summary.
+        sys.stdout.flush()
 
     def _summary_extras(self) -> list:
         """Return additional summary lines for strategy-specific info.

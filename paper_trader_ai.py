@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from collections import deque
 from datetime import datetime
@@ -57,13 +58,17 @@ class ClaudeTrader(PaperTraderBase):
         config: PaperConfig,
         confidence_threshold: int = 70,
         ai_interval: float = 30.0,
-        patience: bool = False,
+        patience: bool = True,
+        max_session_losses: int = 4,
+        extreme_skip_band: tuple = (0.20, 0.80),
     ):
         super().__init__(config)
 
         self.confidence_threshold = confidence_threshold
         self.ai_interval = ai_interval
         self.patience = patience
+        self.max_session_losses = max_session_losses
+        self.extreme_low, self.extreme_high = extreme_skip_band
 
         # Patience tuning constants (strategy-specific, not in PaperConfig)
         self.cooldown_base = 60.0       # base cooldown after closing position
@@ -73,6 +78,7 @@ class ClaudeTrader(PaperTraderBase):
         # Strategy state
         self.last_trade_time: float = 0.0
         self.consecutive_losses: int = 0
+        self.session_locked: bool = False
         self.ai_calls: int = 0
         self.ai_cost_usd: float = 0.0
         self.spot_price: Optional[float] = None
@@ -321,6 +327,40 @@ Respond ONLY with valid JSON:
 
         while True:
             if len(self.price_history["up"]) >= 5:
+                # Session lock: stop spending on AI calls after a streak of
+                # losses signals the strategy doesn't fit current regime.
+                # Keep AI active only when a position is open (need SELL).
+                if (
+                    self.consecutive_losses >= self.max_session_losses
+                    and not self.position
+                ):
+                    if not self.session_locked:
+                        self.log(
+                            f"Session locked: {self.consecutive_losses} consecutive "
+                            f"losses (>= {self.max_session_losses}). AI calls and BUY "
+                            f"paused for rest of session.",
+                            "AI",
+                        )
+                        self.session_locked = True
+                    await asyncio.sleep(self.ai_interval)
+                    continue
+
+                # Extreme guard: when prices are far outside the value band,
+                # the prompt's RULE forces HOLD anyway. Skip the API call.
+                up = self.current_prices.get("up", 0)
+                if (
+                    not self.position
+                    and (up < self.extreme_low or up > self.extreme_high)
+                ):
+                    self.log(
+                        f"Extreme prices (UP={up:.4f} outside "
+                        f"[{self.extreme_low:.2f}, {self.extreme_high:.2f}]), "
+                        f"skipping AI call",
+                        "AI",
+                    )
+                    await asyncio.sleep(self.ai_interval)
+                    continue
+
                 await self.fetch_spot_price()
                 decision = await self.ask_claude()
 
@@ -467,6 +507,11 @@ Respond ONLY with valid JSON:
             f"| SL: -{self.config.stop_loss}"
         )
         self.log("Price boundaries: skip buy if price > 0.70 or < 0.30")
+        self.log(
+            f"AI extreme guard: skip call if UP outside "
+            f"[{self.extreme_low:.2f}, {self.extreme_high:.2f}]"
+        )
+        self.log(f"Session lock: {self.max_session_losses} consecutive losses")
         if self.patience:
             self.log(
                 f"Patience mode: ON (cooldown {self.cooldown_base:.0f}s "
@@ -541,8 +586,19 @@ async def main():
     # variants — we override PaperConfig defaults here to match v4 production tuning.
     parser.add_argument("--tp", type=float, default=0.08, help="Take profit")
     parser.add_argument("--sl", type=float, default=0.06, help="Stop loss")
-    parser.add_argument("--patience", action="store_true",
-                        help="Patience mode: cooldown + higher confidence after losses")
+    parser.add_argument(
+        "--no-patience",
+        dest="patience",
+        action="store_false",
+        help="Disable patience mode (default ON: cooldown + higher confidence after losses)",
+    )
+    parser.add_argument(
+        "--max-session-losses",
+        type=int,
+        default=4,
+        help="Lock session (skip AI/BUY) after N consecutive losses",
+    )
+    parser.set_defaults(patience=True)
     args = parser.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
@@ -562,6 +618,7 @@ async def main():
         confidence_threshold=args.confidence,
         ai_interval=args.interval,
         patience=args.patience,
+        max_session_losses=args.max_session_losses,
     )
 
     try:
