@@ -33,6 +33,7 @@ from src.gamma_client import GammaClient
 from src.paper_trading import (
     PaperConfig,
     PaperTraderBase,
+    make_executor,
     with_retry_async,
 )
 from src.websocket_client import MarketWebSocket, OrderbookSnapshot
@@ -61,19 +62,25 @@ class ClaudeTrader(PaperTraderBase):
         patience: bool = True,
         max_session_losses: int = 4,
         extreme_skip_band: tuple = (0.20, 0.80),
+        cooldown_base: float = 60.0,
+        loss_decay_seconds: float = 180.0,
+        confidence_bump: int = 5,
+        run_name: str = "",
+        executor=None,
     ):
-        super().__init__(config)
+        super().__init__(config, executor=executor)
 
         self.confidence_threshold = confidence_threshold
         self.ai_interval = ai_interval
         self.patience = patience
         self.max_session_losses = max_session_losses
         self.extreme_low, self.extreme_high = extreme_skip_band
+        self.run_name = run_name
 
-        # Patience tuning constants (strategy-specific, not in PaperConfig)
-        self.cooldown_base = 60.0       # base cooldown after closing position
-        self.confidence_bump = 5        # extra confidence per consecutive loss
-        self.loss_decay_seconds = 180.0  # reset 1 loss every 3 min idle
+        # Patience tuning constants (now configurable from YAML)
+        self.cooldown_base = cooldown_base       # base cooldown after closing position
+        self.confidence_bump = confidence_bump   # extra confidence per consecutive loss
+        self.loss_decay_seconds = loss_decay_seconds  # reset 1 loss every N seconds idle
 
         # Strategy state
         self.last_trade_time: float = 0.0
@@ -282,6 +289,10 @@ Respond ONLY with valid JSON:
         mid = snapshot.mid_price
         self.current_prices[side] = mid
         self.price_history[side].append(mid)
+
+        # Let the executor inspect the book — taker no-op, maker checks
+        # whether pending limit orders should fill.
+        self.executor.on_book_update(self, snapshot)
 
         # TP/SL on active position
         if self.position and self.position.side == side:
@@ -499,6 +510,8 @@ Respond ONLY with valid JSON:
 
     async def run(self) -> None:
         self.log(f"Paper trader v3 (Claude AI) starting: {self.config.coin}")
+        if self.run_name:
+            self.log(f"Run config: {self.run_name}")
         self.log(
             f"Size: ${self.config.size_usdc} | Confidence: {self.confidence_threshold}%"
         )
@@ -506,6 +519,7 @@ Respond ONLY with valid JSON:
             f"AI interval: {self.ai_interval}s | TP: +{self.config.take_profit} "
             f"| SL: -{self.config.stop_loss}"
         )
+        self.log(f"Executor: {self.executor.name()}")
         self.log("Price boundaries: skip buy if price > 0.70 or < 0.30")
         self.log(
             f"AI extreme guard: skip call if UP outside "
@@ -572,6 +586,12 @@ async def main():
 
     parser = argparse.ArgumentParser(description="Polymarket Paper Trader (Claude AI)")
     parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to YAML run config. CLI args override YAML when both provided.",
+    )
+    parser.add_argument(
         "--coin",
         default=defaults.coin,
         choices=PaperConfig.supported_coins(),
@@ -601,6 +621,30 @@ async def main():
     parser.set_defaults(patience=True)
     args = parser.parse_args()
 
+    # YAML config: load and apply as fallback for CLI args left at default.
+    # Strategy params (cooldown, decay, bump, extreme band, executor) only live
+    # in YAML — no CLI flag for them, keeps CLI surface small.
+    yaml_data = {}
+    if args.config:
+        import yaml
+        with open(args.config) as f:
+            yaml_data = yaml.safe_load(f) or {}
+        cli_defaults = vars(parser.parse_args([]))
+        # Map yaml keys -> CLI args names. Apply only when CLI value is unchanged.
+        cli_map = {
+            "coin": "coin",
+            "size_usdc": "size",
+            "take_profit": "tp",
+            "stop_loss": "sl",
+            "confidence_threshold": "confidence",
+            "ai_interval": "interval",
+            "patience": "patience",
+            "max_session_losses": "max_session_losses",
+        }
+        for yaml_key, args_key in cli_map.items():
+            if yaml_key in yaml_data and getattr(args, args_key) == cli_defaults.get(args_key):
+                setattr(args, args_key, yaml_data[yaml_key])
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ERROR: Set ANTHROPIC_API_KEY environment variable")
         print("  export ANTHROPIC_API_KEY=sk-ant-...")
@@ -613,12 +657,21 @@ async def main():
         stop_loss=args.sl,
         lookback=100,  # AI variant historically uses larger window
     )
+    # Strategy tunables — sourced from YAML, with hardcoded defaults matching
+    # the production config from 30.04 (so CLI-only invocations keep working).
+    executor = make_executor(yaml_data.get("executor", "taker"))
     trader = ClaudeTrader(
         config=config,
         confidence_threshold=args.confidence,
         ai_interval=args.interval,
         patience=args.patience,
         max_session_losses=args.max_session_losses,
+        cooldown_base=yaml_data.get("cooldown_base", 60.0),
+        loss_decay_seconds=yaml_data.get("loss_decay_seconds", 180.0),
+        confidence_bump=yaml_data.get("confidence_bump", 5),
+        extreme_skip_band=tuple(yaml_data.get("extreme_skip_band", (0.20, 0.80))),
+        run_name=yaml_data.get("name", ""),
+        executor=executor,
     )
 
     try:

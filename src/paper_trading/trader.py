@@ -27,13 +27,13 @@ Extension hooks (override in subclasses):
 """
 
 import sys
-import time
 from collections import deque
 from datetime import datetime
 from typing import Dict, Optional
 
 from .config import PaperConfig
 from .position import PaperPosition
+from .executors import OrderExecutor, TakerExecutor
 
 
 class PaperTraderBase:
@@ -51,8 +51,15 @@ class PaperTraderBase:
         "AI": "*",
     }
 
-    def __init__(self, config: PaperConfig):
+    def __init__(
+        self,
+        config: PaperConfig,
+        executor: Optional[OrderExecutor] = None,
+    ):
         self.config = config
+        # Default to taker — preserves pre-refactor behavior when subclasses
+        # don't pass an executor.
+        self.executor: OrderExecutor = executor or TakerExecutor()
 
         # Position / trade state
         self.position: Optional[PaperPosition] = None
@@ -91,29 +98,13 @@ class PaperTraderBase:
         price: float,
         reason: str = "",
         extra_log: str = "",
-    ) -> PaperPosition:
-        """Open a simulated position. Records to self.position and logs."""
-        shares = self.config.size_usdc / price
-        self.position = PaperPosition(
-            side=side,
-            entry_price=price,
-            size_usdc=self.config.size_usdc,
-            shares=shares,
-            entry_time=time.time(),
-            take_profit=self.config.take_profit,
-            stop_loss=self.config.stop_loss,
-            reason=reason,
-        )
-        msg = (
-            f"PAPER BUY {side.upper()} @ {price:.4f} | "
-            f"${self.config.size_usdc:.2f} = {shares:.1f} shares | "
-            f"TP @ {price + self.config.take_profit:.4f} | "
-            f"SL @ {price - self.config.stop_loss:.4f}"
-        )
-        if extra_log:
-            msg = f"{msg} | {extra_log}"
-        self.log(msg, "BUY")
-        return self.position
+    ) -> Optional[PaperPosition]:
+        """Open a simulated position via the configured executor.
+
+        Returns the position if filled (TakerExecutor always fills),
+        or None if pending/rejected (e.g., MakerExecutor with limit out of book).
+        """
+        return self.executor.submit_buy(self, side, price, reason, extra_log)
 
     def paper_sell(
         self,
@@ -121,44 +112,11 @@ class PaperTraderBase:
         reason: str,
         extra_log: str = "",
     ) -> Optional[dict]:
-        """Close current position, append trade record, log result.
+        """Close current position via the configured executor.
 
-        Returns the trade dict, or None if no position was open.
-        Subclasses can react to trade closure via `_on_trade_closed`.
+        Returns the trade dict if closed, None if no position or pending.
         """
-        if not self.position:
-            return None
-
-        pnl = self.position.pnl(price)
-        pnl_pct = self.position.pnl_pct(price)
-        hold_time = time.time() - self.position.entry_time
-
-        trade = {
-            "side": self.position.side,
-            "entry": self.position.entry_price,
-            "exit": price,
-            "pnl": pnl,
-            "pnl_pct": pnl_pct,
-            "hold_seconds": hold_time,
-            "reason": reason,
-            "entry_reason": self.position.reason,
-            "time": datetime.now().isoformat(),
-        }
-        self.trades.append(trade)
-
-        level = "WIN" if pnl >= 0 else "LOSS"
-        msg = (
-            f"PAPER SELL {self.position.side.upper()} @ {price:.4f} | "
-            f"{reason} | PnL: ${pnl:+.2f} ({pnl_pct:+.1f}%) | "
-            f"hold: {hold_time:.0f}s"
-        )
-        if extra_log:
-            msg = f"{msg} | {extra_log}"
-        self.log(msg, level)
-
-        self.position = None
-        self._on_trade_closed(trade)
-        return trade
+        return self.executor.submit_sell(self, price, reason, extra_log)
 
     def _on_trade_closed(self, trade: dict) -> None:
         """Hook called after a trade is appended. Override in subclasses

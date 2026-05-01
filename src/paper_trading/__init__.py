@@ -12,14 +12,18 @@ import from here and add their own strategy logic on top.
 """
 
 from .config import PaperConfig
+from .executors import OrderExecutor, TakerExecutor, make_executor
 from .position import PaperPosition
 from .retry import with_retry, with_retry_async
 from .trader import PaperTraderBase
 
 __all__ = [
+    "OrderExecutor",
     "PaperConfig",
     "PaperPosition",
     "PaperTraderBase",
+    "TakerExecutor",
+    "make_executor",
     "with_retry",
     "with_retry_async",
 ]

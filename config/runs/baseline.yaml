@@ -1,0 +1,35 @@
+# Baseline run config — taker executor, current production tuning.
+# Used as control group at start and mid-cycle of A/B test sequence.
+#
+# To run: python paper_trader_ai.py --config config/runs/baseline.yaml
+# CLI args still override YAML values when both present.
+
+name: baseline
+description: Taker executor, A+B+C fixes from 30.04, no other tuning. Control group.
+
+# Position / market
+coin: ETH
+size_usdc: 10.0
+
+# Take profit / stop loss
+take_profit: 0.08
+stop_loss: 0.06
+
+# AI loop
+confidence_threshold: 70
+ai_interval: 30.0
+
+# Patience mode (Fix C from 30.04)
+patience: true
+cooldown_base: 60.0
+loss_decay_seconds: 180.0
+confidence_bump: 5
+
+# Session safety (Fix C from 30.04)
+max_session_losses: 4
+
+# Extreme prices guard (Fix B from 30.04)
+extreme_skip_band: [0.20, 0.80]
+
+# Order execution policy
+executor: taker

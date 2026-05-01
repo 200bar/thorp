@@ -1,0 +1,25 @@
+# Tighter TP/SL — DR recommendation: TP 0.05, SL 0.04.
+#
+# Current 0.08/0.06 produces 14-17% loss legs (intra-tick volatility blasts
+# through SL in 3-22s on Run #2). DR argues smaller targets fit Polymarket's
+# choppy 15-min markets better.
+
+name: tighter-tp-sl
+description: TP 0.08→0.05, SL 0.06→0.04 per DR. Smaller targets, tighter SL.
+
+coin: ETH
+size_usdc: 10.0
+take_profit: 0.05      # was 0.08
+stop_loss: 0.04        # was 0.06
+
+confidence_threshold: 70
+ai_interval: 30.0
+
+patience: true
+cooldown_base: 60.0
+loss_decay_seconds: 180.0
+confidence_bump: 5
+
+max_session_losses: 4
+extreme_skip_band: [0.20, 0.80]
+executor: taker
